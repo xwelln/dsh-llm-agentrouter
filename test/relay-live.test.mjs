@@ -18,8 +18,21 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const require_ = createRequire(import.meta.url)
+
+/**
+ * An absolute path as a dynamic-import specifier.
+ *
+ * Windows ESM rejects `C:\...` in `import()` (it reads the drive letter as a
+ * URL scheme), so absolute paths must go through `pathToFileURL`. POSIX paths
+ * are unchanged by the conversion, which keeps the upstream CI green.
+ *
+ * @param {string} path - an absolute filesystem path.
+ * @returns {string} the specifier `import()` accepts on this platform.
+ */
+const asImportSpecifier = (path) => pathToFileURL(path).href
 
 /**
  * The pi-ai `dist` directory, or undefined when the package is not installed.
@@ -87,9 +100,9 @@ function relayKey() {
 const key = relayKey()
 const dist = piAiDist()
 const SENTINEL_HOST = 'relay.agentrouter.internal'
-// The route's own baseURL: the fence is what makes it reach anything, which is
-// exactly the seam this test exercises.
-const RELAY_BASE_URL = `https://${SENTINEL_HOST}/v1`
+// The routes' own baseURLs: the fence is what makes them reach anything, which
+// is exactly the seam these tests exercise.
+const RELAY_HOST_ROOT = `https://${SENTINEL_HOST}`
 const ENDPOINT = process.env.AGENTROUTER_ENDPOINT ?? 'cn'
 const RELAY_HOST = process.env.AGENTROUTER_HOST
 const HARNESS_UA = 'deepseek-harness/0.1.1 (+https://github.com/deepseek-ai/deepseek-harness)'
@@ -97,113 +110,179 @@ const HARNESS_UA = 'deepseek-harness/0.1.1 (+https://github.com/deepseek-ai/deep
 const skip =
   key === undefined ? 'no AGENTROUTER_API_KEY' : dist === undefined ? 'pi-ai is not installed' : false
 
-test('the declared route streams a turn from the relay', { skip }, async () => {
-  const { createModels, createProvider } = await import(`${dist}/index.js`)
-  // The lazy factory, exactly as `dsh-llm-pi-ai` resolves it from its protocol
-  // table: `createProvider` wants the built streams object, not the module.
-  const { openAICompletionsApi } = await import(`${dist}/api/openai-completions.lazy.js`)
-  const { apply, Config } = await import('../lib/index.js')
-
-  // The fence, activated exactly as the harness activates it: the entry config
-  // is the authority when no settings service is present, which is this case.
-  const disposers = []
-  const config = Config({
-    endpoint: ENDPOINT,
-    ...(RELAY_HOST === undefined ? {} : { endpoints: { cn: RELAY_HOST, intl: RELAY_HOST } }),
-    announce: false,
-  })
-  apply(
-    {
-      effect: (fn) => disposers.push(fn() ?? (() => {})),
-      // No settings service in this harness, so the injection never fires and
-      // the composed entry stays the authority — the headless posture.
-      inject: () => {},
-      logger: { info() {}, warn() {} },
+/**
+ * The three declared routes, one entry per wire protocol.
+ *
+ * Each entry restates its route from cordis.patch.yml — the lazy api factory
+ * the adapter resolves, the baseURL suffix that protocol's SDK expects, the
+ * model, its compat block, and a reasoning level the route offers — so a live
+ * run proves each protocol's request shape survives the fence and is accepted
+ * by the relay, not just the first one's.
+ *
+ * Every entry probes with glm-5.3: the relay serves it over all three
+ * protocols (verified by hand), its budget pool is separate from the
+ * Claude / GPT one that 402s when exhausted, and it always thinks — which
+ * exercises the reasoning path of each protocol rather than sidestepping it.
+ */
+const ROUTES = [
+  {
+    label: 'openai-completions',
+    lazyModule: 'api/openai-completions.lazy.js',
+    factoryName: 'openAICompletionsApi',
+    baseUrl: `${RELAY_HOST_ROOT}/v1`,
+    modelId: 'glm-5.3',
+    modelName: 'GLM 5.3',
+    contextWindow: 1000000,
+    maxTokens: 131072,
+    thinkingLevelMap: { low: 'low', high: 'high', max: 'max' },
+    reasoning: 'low',
+    compat: {
+      thinkingFormat: 'openai',
+      supportsReasoningEffort: true,
+      supportsDeveloperRole: false,
+      maxTokensField: 'max_tokens',
+      supportsStore: false,
+      supportsStrictMode: true,
+      supportsUsageInStreaming: true,
     },
-    config,
-  )
+  },
+  {
+    label: 'anthropic-messages',
+    lazyModule: 'api/anthropic-messages.lazy.js',
+    factoryName: 'anthropicMessagesApi',
+    // The Anthropic SDK appends /v1/messages itself, so the baseURL stops at
+    // the host root — a /v1 suffix would produce /v1/v1/messages.
+    baseUrl: RELAY_HOST_ROOT,
+    modelId: 'glm-5.3',
+    modelName: 'GLM 5.3',
+    contextWindow: 1000000,
+    maxTokens: 131072,
+    thinkingLevelMap: { low: 'low', high: 'high', max: 'max' },
+    reasoning: 'low',
+    compat: {
+      supportsTemperature: false,
+      supportsStrictTools: true,
+    },
+  },
+  {
+    label: 'openai-responses',
+    lazyModule: 'api/openai-responses.lazy.js',
+    factoryName: 'openAIResponsesApi',
+    // The Responses SDK appends /responses, so the /v1 prefix stays.
+    baseUrl: `${RELAY_HOST_ROOT}/v1`,
+    modelId: 'glm-5.3',
+    modelName: 'GLM 5.3',
+    contextWindow: 1000000,
+    maxTokens: 131072,
+    thinkingLevelMap: { low: 'low', medium: 'medium', high: 'high', max: 'max' },
+    reasoning: 'low',
+    compat: {
+      supportsStrictMode: true,
+    },
+  },
+]
 
-  try {
-    const provider = createProvider({
-      id: 'agentrouter',
-      name: 'AgentRouter',
-      baseUrl: RELAY_BASE_URL,
-      // The same auth shape `dsh-llm-pi-ai` builds for a hand-declared route
-      // (`harnessApiKeyAuth`): the harness has already resolved the credential,
-      // so this hands it straight to the protocol.
-      auth: {
-        apiKey: {
-          name: 'AgentRouter',
-          resolve: ({ credential }) =>
-            Promise.resolve({ auth: { apiKey: credential?.key ?? key }, source: 'test' }),
-        },
-      },
-      api: openAICompletionsApi(),
-      models: [
-        {
-          id: 'claude-opus-5',
-          name: 'Claude Opus 5',
-          api: 'openai-completions',
-          provider: 'agentrouter',
-          baseUrl: RELAY_BASE_URL,
-          input: ['text'],
-          // pi-ai's usage accounting reads `cost.tiers`, so a model descriptor
-          // needs a cost block even when nothing consumes the number. The real
-          // adapter materializes one from its catalog; this restates a zero.
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 1000000,
-          maxTokens: 128000,
-          reasoning: true,
-          thinkingLevelMap: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
-          compat: {
-            thinkingFormat: 'openai',
-            supportsReasoningEffort: true,
-            supportsDeveloperRole: false,
-            maxTokensField: 'max_tokens',
-            supportsStore: false,
-            supportsStrictMode: true,
-            supportsUsageInStreaming: true,
-          },
-        },
-      ],
+for (const spec of ROUTES) {
+  test(`the declared ${spec.label} route streams a turn from the relay`, { skip }, async () => {
+    const { createModels, createProvider } = await import(asImportSpecifier(join(dist, 'index.js')))
+    // The lazy factory, exactly as `dsh-llm-pi-ai` resolves it from its protocol
+    // table: `createProvider` wants the built streams object, not the module.
+    const lazyModule = await import(asImportSpecifier(join(dist, spec.lazyModule)))
+    const { apply, Config } = await import('../lib/index.js')
+
+    // The fence, activated exactly as the harness activates it: the entry config
+    // is the authority when no settings service is present, which is this case.
+    const disposers = []
+    const config = Config({
+      endpoint: ENDPOINT,
+      ...(RELAY_HOST === undefined ? {} : { endpoints: { cn: RELAY_HOST, intl: RELAY_HOST } }),
+      announce: false,
     })
-
-    const models = createModels()
-    models.setProvider(provider)
-    const model = models.getModel('agentrouter', 'claude-opus-5')
-
-    // The harness sends its attribution User-Agent on every request; the fence
-    // is what turns it into the one the relay accepts.
-    const stream = models.streamSimple(
-      model,
-      { messages: [{ role: 'user', content: 'Reply with exactly: ok' }] },
+    apply(
       {
-        maxTokens: 32,
-        reasoning: 'low',
-        headers: { 'user-agent': HARNESS_UA },
+        effect: (fn) => disposers.push(fn() ?? (() => {})),
+        // No settings service in this harness, so the injection never fires and
+        // the composed entry stays the authority — the headless posture.
+        inject: () => {},
+        logger: { info() {}, warn() {} },
       },
+      config,
     )
 
-    const message = await stream.result()
-    if (message.stopReason === 'error') {
-      // The relay is in budget-pool exhaustion: accept the 402 annotation.
-      // The fence must have kept the original message and appended the hint.
-      assert.match(
-        message.errorMessage ?? '',
-        /Claude.*GPT.*本批额度已用完|Budget pool quota|quota\b.*exhausted/i,
-        `the error message does not look like a quota annotation: ${message.errorMessage ?? ''}`,
+    try {
+      const provider = createProvider({
+        id: 'agentrouter',
+        name: 'AgentRouter',
+        baseUrl: spec.baseUrl,
+        // The same auth shape `dsh-llm-pi-ai` builds for a hand-declared route
+        // (`harnessApiKeyAuth`): the harness has already resolved the credential,
+        // so this hands it straight to the protocol.
+        auth: {
+          apiKey: {
+            name: 'AgentRouter',
+            resolve: ({ credential }) =>
+              Promise.resolve({ auth: { apiKey: credential?.key ?? key }, source: 'test' }),
+          },
+        },
+        api: lazyModule[spec.factoryName](),
+        models: [
+          {
+            id: spec.modelId,
+            name: spec.modelName,
+            api: spec.label,
+            provider: 'agentrouter',
+            baseUrl: spec.baseUrl,
+            input: ['text'],
+            // pi-ai's usage accounting reads `cost.tiers`, so a model descriptor
+            // needs a cost block even when nothing consumes the number. The real
+            // adapter materializes one from its catalog; this restates a zero.
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: spec.contextWindow,
+            maxTokens: spec.maxTokens,
+            reasoning: true,
+            thinkingLevelMap: spec.thinkingLevelMap,
+            compat: spec.compat,
+          },
+        ],
+      })
+
+      const models = createModels()
+      models.setProvider(provider)
+      const model = models.getModel('agentrouter', spec.modelId)
+
+      // The harness sends its attribution User-Agent on every request; the fence
+      // is what turns it into the one the relay accepts.
+      const stream = models.streamSimple(
+        model,
+        { messages: [{ role: 'user', content: 'Reply with exactly: ok' }] },
+        {
+          maxTokens: 32,
+          reasoning: spec.reasoning,
+          headers: { 'user-agent': HARNESS_UA },
+        },
       )
-    } else {
-      const text = message.content
-        .filter((block) => block.type === 'text')
-        .map((block) => block.text)
-        .join('')
-      assert.match(text.toLowerCase(), /ok/, `expected an answer through the fence, got ${JSON.stringify(text)}`)
+
+      const message = await stream.result()
+      if (message.stopReason === 'error') {
+        // The relay is in budget-pool exhaustion: accept the 402 annotation.
+        // The fence must have kept the original message and appended the hint.
+        assert.match(
+          message.errorMessage ?? '',
+          /Claude.*GPT.*本批额度已用完|Budget pool quota|quota\b.*exhausted/i,
+          `the error message does not look like a quota annotation: ${message.errorMessage ?? ''}`,
+        )
+      } else {
+        const text = message.content
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join('')
+        assert.match(text.toLowerCase(), /ok/, `expected an answer through the fence, got ${JSON.stringify(text)}`)
+      }
+    } finally {
+      for (const dispose of disposers.reverse()) dispose()
     }
-  } finally {
-    for (const dispose of disposers.reverse()) dispose()
-  }
-})
+  })
+}
 
 test('without the fence the relay rejects the harness User-Agent', { skip: key === undefined ? 'no AGENTROUTER_API_KEY' : false }, async () => {
   // The negative control that gives the test above its meaning: the relay gates

@@ -1,5 +1,6 @@
-# dsh-llm-agentrouter bundle patch — the AgentRouter relay as ONE provider route
-# whose endpoint is a runtime choice, plus the fence that makes both possible.
+# dsh-llm-agentrouter bundle patch — the AgentRouter relay as one provider route
+# per wire protocol (three in all), each with a runtime endpoint choice, plus
+# the fence that makes both possible.
 #
 # Applied after the dsh-base / dsh-web-app bundle layers, so the `llm-pi-ai`
 # row below overrides the dormant zero-route entry dsh-base mounts.
@@ -11,6 +12,25 @@
 # re-make on every model switch. It is not a model property — it is one
 # deployment-wide setting, so it lives in this plugin's own settings section and
 # the picker shows one AgentRouter group.
+#
+# WHY THREE ROUTES AND NOT ONE
+# The adapter reads the protocol (`api:`) from the route, and a route is one
+# protocol: a request is built in that wire format before the fence ever sees
+# it, so a runtime protocol switch would mean translating request bodies —
+# which no configuration can express. The relay accepts the same models over
+# three protocols (`openai-completions`, `anthropic-messages`,
+# `openai-responses`), so the protocol is a per-route choice, one group per
+# protocol in the picker. All three share ONE sentinel host and ONE credential
+# reference: the fence rewrites by host and preserves the path, so the three
+# protocols' differing baseURL suffixes flow through untouched, and one relay
+# account serves all of them.
+#
+# WHICH MODELS UNDER WHICH PROTOCOL
+# `anthropic-messages` carries only the two Claude models — that is what the
+# protocol is for, and the official pi-ai catalog declares no GPT/DeepSeek/GLM
+# under it. `openai-responses` mirrors the first-party OpenAI shape for the one
+# GPT model the relay serves; the DeepSeek and GLM models stay on
+# `openai-completions`, which remains the default group.
 #
 # WHY THE BASE URL IS A SENTINEL
 # `baseURL` is resolved once per request by the adapter, but it cannot read this
@@ -35,6 +55,16 @@
 # anthropic-messages, gpt-5.6-sol via openai-responses. A hand-declared route
 # inherits nothing, so capacities, reasoning levels, and compat switches are
 # restated here from that catalog, adjusted for Chat Completions.
+#
+# The two protocol siblings below restate their models' entries from the same
+# catalog, limited to what a hand-declared route may configure: pi-ai's adapter
+# splits every compat field into offered (settable here) and withheld (only
+# its installed catalog may set them for vendor routes). Capacities and
+# thinkingLevelMap are restated VERBATIM because they are the protocol's own
+# semantics; withheld compat switches are simply omitted, and the models work
+# without them. Only the baseURL differs — each protocol's SDK appends its own
+# path suffix, so anthropic-messages stops at the host root (its SDK appends
+# /v1/messages) while the two OpenAI-shaped protocols carry /v1.
 #
 # `reasoningEfforts` keys are the levels the picker offers; each value is the
 # wire spelling sent as `reasoning_effort`. All three models were probed against
@@ -137,6 +167,86 @@
             reasoningEfforts:
               low: low
               high: high
+              max: max
+
+      # ── anthropic-messages sibling ─────────────────────────────────────────
+      # Same sentinel host, same credential reference, different wire protocol.
+      # `thinkingLevelMap` here is restated VERBATIM from the official pi-ai
+      # catalog (anthropic provider): Opus 5 / 4.8 are adaptive-thinking models
+      # that offer only xhigh / max as discrete levels. The Anthropic SDK
+      # appends /v1/messages itself, so the baseURL stops at the host root —
+      # a /v1 suffix would produce /v1/v1/messages.
+      agentrouter-anthropic:
+        displayName: AgentRouter (Anthropic)
+        apiKeyEnv: AGENTROUTER_API_KEY
+        api: anthropic-messages
+        # Rewritten per request by llm-agentrouter to the selected endpoint.
+        baseURL: https://relay.agentrouter.internal
+        defaultInput:
+          - text
+        # Restated from the catalog's anthropic provider entries: adaptive
+        # thinking is forced on (the model decides), temperature is not sent,
+        # strict tools are supported.
+        compat:
+          forceAdaptiveThinking: true
+          supportsTemperature: false
+          supportsStrictTools: true
+        models:
+          - id: claude-opus-5
+            name: Claude Opus 5
+            contextWindow: 1000000
+            maxTokens: 128000
+            reasoningEfforts:
+              xhigh: xhigh
+              max: max
+          - id: claude-opus-4-8
+            name: Claude Opus 4.8
+            contextWindow: 1000000
+            maxTokens: 128000
+            reasoningEfforts:
+              xhigh: xhigh
+              max: max
+
+      # ── openai-responses sibling ───────────────────────────────────────────
+      # Same sentinel host, same credential reference, the Responses wire
+      # protocol the first-party OpenAI provider itself uses for gpt-5.6-sol.
+      # `thinkingLevelMap` is restated VERBATIM from that catalog entry —
+      # including `off: none` and `minimal: null`, whose OpenAI Responses
+      # spellings differ from the Chat Completions ones above.
+      agentrouter-responses:
+        displayName: AgentRouter (Responses)
+        apiKeyEnv: AGENTROUTER_API_KEY
+        api: openai-responses
+        # Rewritten per request by llm-agentrouter to the selected endpoint.
+        # The Responses SDK appends /responses, so the /v1 prefix stays.
+        baseURL: https://relay.agentrouter.internal/v1
+        defaultInput:
+          - text
+        # Only the fields the Responses protocol OFFERS to a hand-declared
+        # route. The catalog entry also carries supportsOpenAIGrammarTools,
+        # supportsToolSearch, and supportsExplicitPromptCacheMode, but the
+        # adapter marks those "withhold" — settable only by pi-ai's installed
+        # catalog for the vendors that need them; naming them here is a load
+        # error, and the model works without them.
+        compat:
+          supportsStrictMode: true
+        models:
+          - id: gpt-5.6-sol
+            name: GPT 5.6 Sol
+            contextWindow: 272000
+            maxTokens: 128000
+            # `off: none` keeps the Responses spelling of Off. `minimal` is
+            # deliberately ABSENT: the catalog pins it unsupported for this
+            # model (`thinkingLevelMap: { minimal: null }`), and in a route
+            # declaration an omitted level is exactly that pin — a declared
+            # level must carry the wire value dispatch should send, and only
+            # `off` may be empty.
+            reasoningEfforts:
+              off: none
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
               max: max
 
 # The endpoint switch and the User-Agent fence. Both are one plugin because both
