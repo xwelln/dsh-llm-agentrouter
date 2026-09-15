@@ -3,36 +3,46 @@
 [![test](https://github.com/aqiu817/dsh-llm-agentrouter/actions/workflows/test.yml/badge.svg)](https://github.com/aqiu817/dsh-llm-agentrouter/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-把 AgentRouter 中转站接入 DeepSeek Harness 的 profile bundle：一条 provider 路由、五个模型及其推理档位，一个在「设置 → 插件」里切换国内 / 国际端点的开关，以及一层让出站请求符合该中转站要求的兼容处理。
+把 AgentRouter 中转站接入 DeepSeek Harness 的 profile bundle：三条 provider 路由（openai-completions / anthropic-messages / openai-responses 三种线上协议各一条）、五个模型及其推理档位，一个在「设置 → 插件」里切换国内 / 国际端点的开关，以及一层让出站请求符合该中转站要求的兼容处理。
 
 ## 它做了什么
 
 | 组成 | 位置 | 职责 |
 | --- | --- | --- |
-| 路由声明 | `cordis.patch.yml` | 覆盖 `llm-pi-ai` 行，声明单条 `agentrouter` 路由，`baseURL` 指向一个哨兵主机 |
+| 路由声明 | `cordis.patch.yml` | 覆盖 `llm-pi-ai` 行，声明三条 `agentrouter*` 路由（每协议一条），`baseURL` 指向同一个哨兵主机 |
 | 端点 + 请求兼容 | `lib/index.js` | 注册 `llm-agentrouter` 设置分节；把哨兵主机改写为所选端点，并把 `user-agent` 换成该中转站要求的取值 |
 | 端点开关 | `lib/client.js` | 浏览器端插件，在「设置 → 插件」渲染国内 / 国际单选卡片 |
-| 行为测试 | `test/` | 24 项：浏览器 bundle 6 项、bundle patch 7 项、改写语义 9 项（含 3 项 402 注释）、活体流式 1 项、未经改写必被拒的反向对照 1 项 |
+| 行为测试 | `test/` | 32 项：浏览器 bundle 6 项、bundle patch 13 项（含两条路由声明的离线守卫）、改写语义 9 项（含 3 项 402 注释）、活体流式 3 项（三协议各一）、未经改写必被拒的反向对照 1 项 |
 
-## 为什么是一条路由，而不是两条
+## 为什么端点是设置，协议是三条路由
 
-中转站在国内与国际两个源站上提供同样的模型，差别只在 origin。曾经每个端点各声明一条路由，代价是模型选择器里每个模型出现两次，而「用哪个端点」这个与模型无关的选择，被迫在每次换模型时重做一遍。它不是模型属性，而是一项部署级设置——于是它成了本插件自己的设置分节，选择器里只留一个 AgentRouter 分组。
+「用哪个端点」与模型无关，是部署级选择——所以它是本插件自己的设置分节，三条路由共用一个分组级的端点开关；「用哪种协议」则不同：适配器按路由的 `api` 字段构建请求体，请求在围栏看到之前就已经是该协议的线上格式，运行时切换协议等于翻译请求体，任何配置都表达不了。因此协议是路由级选择，一种协议一条路由，模型选择器里各成一个分组。
 
-适配器读不到本插件的命名空间，所以路由的 `baseURL` 指向一个**故意不可解析**的哨兵主机（`.internal` 保留域），由围栏在出站时改写为所选端点。围栏本来就必须在请求路径上——见下一节——因此这没有引入新的机制。
+三条路由共用**同一个哨兵主机**与**同一个凭据引用**：围栏只按主机改写并保留路径，三个协议各不相同的 baseURL 后缀原样通过；围栏本来就必须在请求路径上（中转站按 `User-Agent` 认证客户端），因此多两条路由没有引入任何新机制。
+
+适配器读不到本插件的命名空间，所以路由的 `baseURL` 指向一个**故意不可解析**的哨兵主机（`.internal` 保留域），由围栏在出站时改写为所选端点。一个未改写的请求会解析失败，而不是到达任何真实服务器。
 
 本插件使用兼容方式支持了 AgentRouter 中转站请求。
 
 ## 当前版本所支持的模型与参数
 
+三条路由的分组与模型（同一模型可能出现在多个分组，各分组走不同的线上协议）：
+
+| 分组 | 协议（线上端点） | 模型 |
+| --- | --- | --- |
+| `AgentRouter` | openai-completions（`/v1/chat/completions`） | 全部五个 |
+| `AgentRouter (Anthropic)` | anthropic-messages（`/v1/messages`） | Claude Opus 5 / 4.8 |
+| `AgentRouter (Responses)` | openai-responses（`/v1/responses`） | GPT 5.6 Sol |
+
 | 模型 ID | 名称 | 上下文窗口 | 最大输出 | 推理强度（档位） | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| `claude-opus-5` | Claude Opus 5 | 1,000,000 | 128,000 | off / low / medium / high / xhigh / max |  |
-| `claude-opus-4-8` | Claude Opus 4.8 | 1,000,000 | 128,000 | off / low / medium / high / xhigh / max |  |
-| `gpt-5.6-sol` | GPT 5.6 Sol | 272,000 | 128,000 | off / minimal / low / medium / high / xhigh / max |  |
+| `claude-opus-5` | Claude Opus 5 | 1,000,000 | 128,000 | off / low / medium / high / xhigh / max；Anthropic 分组下 xhigh / max | Anthropic 分组下为自适应思考 |
+| `claude-opus-4-8` | Claude Opus 4.8 | 1,000,000 | 128,000 | off / low / medium / high / xhigh / max；Anthropic 分组下 xhigh / max | Anthropic 分组下为自适应思考 |
+| `gpt-5.6-sol` | GPT 5.6 Sol | 272,000 | 128,000 | off / low / medium / high / xhigh / max（Responses 分组下 `off` 送 `none`，无 `minimal`） |  |
 | `deepseek-v4-flash` | DeepSeek V4 Flash | 1,000,000 | 256,000 | off / low / high / max | 档位对齐第一方目录；`off` 送出 `none` 而非留空 |
 | `glm-5.3` | GLM 5.3 | 1,000,000 | 131,072 | low / high / max | 始终思考，不提供关闭选项 |
 
-> 所有模型均走 `/v1/chat/completions`。两个端点的 `/v1/models` 返回同一组 ID。`maxTokens` 上限来自中转站返回值约束，上下文窗口以「大海捞针」实测为准。
+> 三种协议的端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）均经同一 key 实测 200。两个端点的 `/v1/models` 返回同一组 ID。`maxTokens` 上限来自中转站返回值约束，上下文窗口以「大海捞针」实测为准。Anthropic / Responses 路由的档位与 compat 照 pi-ai 内置目录对应厂商条目复述，仅保留适配器允许手写路由声明的字段。
 
 ## 安装
 
@@ -46,7 +56,7 @@ dsh plugin --profile web add dsh-llm-agentrouter
 #    Web 的「模型」设置页可直接写入 ~/.dsh/.credentials.yaml，
 #    或让 AGENTROUTER_API_KEY 存在于进程环境中
 
-# 3) 重启 host。模型选择器里出现 AgentRouter 分组，
+# 3) 重启 host。模型选择器里出现 AgentRouter 三个分组，
 #    「设置 → 插件 → AgentRouter 中转站」出现端点开关
 ```
 
@@ -83,7 +93,7 @@ llm-agentrouter:
 
 无浏览器时直接编辑该文件即可，语义完全一致；没有设置服务的场景（headless、服务挂载之前）则回落到 bundle 里组合出的入口配置。
 
-模型选择器里为何不能直接切？那个菜单不渲染任何子插槽，每个分组只显示 `displayName`，每个模型只显示名称与「适配器提供的描述」——而手工声明的 pi-ai 路由没有可填描述的字段。分组名是唯一可落笔处，但它是名字而不是告示，因此仍写作 `AgentRouter`；解释留在真正能改动它的地方。
+模型选择器里为何不能直接切？那个菜单不渲染任何子插槽，每个分组只显示 `displayName`，每个模型只显示名称与「适配器提供的描述」——而手工声明的 pi-ai 路由没有可填描述的字段。分组名是唯一可落笔处，但它是名字而不是告示，因此仍写作 `AgentRouter` 系列（协议差异标注在分组名上）；解释留在真正能改动它的地方。
 
 ## 国际端点
 
@@ -120,10 +130,11 @@ NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://<代理主机>:<端口> dsh web
 
 - **图片输入未声明。** 路由是 `defaultInput: [text]`。探测中转站的图片请求得到超时与 Bedrock 429，未能确认，因此按保守一侧声明：少声明的代价是一次点名该模型的拒绝，多声明的代价是消息已持久化后再被提供方拒绝，会话将不断重试一个不可能成功的请求。
 - **这层兼容处理是进程级的全局替换。** 它按主机分派，对其他主机零影响；但同一进程内若有另一个包装层在它之后安装，卸载时本插件会主动让位，不去夺回全局。
-- **一条凭据服务两个端点。** 因为它们是同一个中转站账号。若两个端点日后使用不同账号，需要拆回两条路由。
+- **一条凭据服务两个端点与三种协议。** 因为它们是同一个中转站账号。若两个端点日后使用不同账号，需要拆回按端点的路由。
+- **手写路由不能复述目录的全部 compat 字段。** pi-ai 适配器把 compat 字段分为 offered / withheld 两档，withheld（如 `supportsOpenAIGrammarTools`、`supportsToolSearch`）只允许其内置目录为厂商路由设置，手写路由声明即加载错误；这些字段在两条协议兄弟路由中已省略，模型不带它们也能正常工作。同理，路由 DSL 中声明推理档位必须给出线上拼写（仅 `off` 可留空），「该档不支持」的正确表达是整行省略。两类形状均有离线守卫测试拦截。
 - **浏览器 bundle 是手写的。** 生成它的 `clientBundle` tsdown 预设未发布，所以 `lib/client.js` 直接以加载器的 lazy-CJS 工厂格式写成，样式类名自带前缀而非 CSS module 哈希。测试因此覆盖了通常由构建保证的部分：注册协议、所需模块说明符、两份词典的键一致性。
-- **端点切换不影响进行中的请求。** 它在下一次 `fetch` 生效；正在流式返回的那一轮仍走旧端点。
-- **模型选择器里既不能切换，也不作提示。** 见上文；若上游日后给模型条目加上适配器可填的描述字段，或给该菜单开出子插槽，端点状态才可能显示在贴近选择的位置。
+- **端点切换不影响进行中的请求。** 它在下一次 `fetch` 生效；正在流式返回的那一轮仍走旧端点。协议同理：换分组即换路由，进行中的一轮不受影响。
+- **模型选择器里既不能切换端点，也不作提示。** 见上文；若上游日后给模型条目加上适配器可填的描述字段，或给该菜单开出子插槽，端点状态才可能显示在贴近选择的位置。
 - **Claude / GPT 配额耗尽时以 402 呈现。** 中转站在 Claude / GPT 预算池额度用尽时返回 HTTP 402，且把 JSON 错误体错标成 `text/event-stream`。围栏识别这类响应：保留中转站原始错误信息，并追加 `quotaHint` 提示（默认「Claude / GPT 本批额度已用完，请等待下一批投放。」），让提供方 SDK 把它当作真正的 API 错误而非传输失败。
 
 ## 兼容性
@@ -144,10 +155,10 @@ NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://<代理主机>:<端口> dsh web
 
 ```bash
 npm ci        # 仅测试所需的 devDependencies
-npm test      # 24 项
+npm test      # 32 项
 ```
 
-克隆后即可跑：24 项中 22 项完全离线，2 项活体测试在无 key 时自动跳过（空字符串等同于无 key——未配置的 GitHub Actions secret 正是以空串到达）。CI（`.github/workflows/test.yml`）跑的就是这一条命令；仓库若配置了 `AGENTROUTER_API_KEY` secret，那两项也会真跑。
+克隆后即可跑：32 项中 29 项完全离线，3 项活体测试（三协议各一）在无 key 时自动跳过（空字符串等同于无 key——未配置的 GitHub Actions secret 正是以空串到达）。CI（`.github/workflows/test.yml`）跑的就是这一条命令；仓库若配置了 `AGENTROUTER_API_KEY` secret，那三项也会真跑。
 
 活体测试需要一个可解析的 key，否则自动跳过——因此离线也能跑完整套。key 的来源，按优先级：
 
@@ -156,7 +167,7 @@ npm test      # 24 项
 | `AGENTROUTER_API_KEY` 环境变量 | 在 CI 中用这一种（配置为仓库 secret） |
 | `$DSH_HOME/.credentials.yaml` 的 `refs.AGENTROUTER_API_KEY` | dsh 模型设置页写入的位置 |
 
-测试从不打印、记录或断言密钥本身。可用 `AGENTROUTER_ENDPOINT`（`cn`/`intl`）选择活体测试所用端点、`AGENTROUTER_HOST` 直接覆盖主机，用 `DSH_PI_AI_DIST` 指定 pi-ai 的 `dist` 路径（默认按 require 解析，再退回 Node 旁的 dsh 全局安装）。
+测试从不打印、记录或断言密钥本身。可用 `AGENTROUTER_ENDPOINT`（`cn`/`intl`）选择活体测试所用端点、`AGENTROUTER_HOST` 直接覆盖主机，用 `DSH_PI_AI_DIST` 指定 pi-ai 的 `dist` 路径（默认按 require 解析，再退回 Node 旁的 dsh 全局安装）。活体测试以 `glm-5.3` 探测三种协议：中转站对它三协议全通、预算池独立于 Claude / GPT，且它始终思考，恰好把每条协议的 reasoning 路径都真实走到。
 
 ## 贡献与许可
 
